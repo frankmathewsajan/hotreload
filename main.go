@@ -16,200 +16,153 @@ import (
 )
 
 var (
-	activeCmd   *exec.Cmd
-	cmdMutex    sync.Mutex
-	buildCancel context.CancelFunc
-	buildMutex  sync.Mutex
+	srv       *exec.Cmd
+	srvMu     sync.Mutex
+	bldCancel context.CancelFunc
+	bldMu     sync.Mutex
 )
 
-// runBuild compiles the target binary.
-func runBuild(ctx context.Context, commandString string) error {
-	slog.Info("Initiating compilation...", "command", commandString)
-	parts := strings.Split(commandString, " ")
+// prep wires a command to the terminal output
+func prep(ctx context.Context, cmdStr string) *exec.Cmd {
+	parts := strings.Split(cmdStr, " ")
 	cmd := exec.CommandContext(ctx, parts[0], parts[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	return cmd
 }
 
-// startServer ignites the compiled binary.
-func startServer(commandString string) error {
-	cmdMutex.Lock()
-	defer cmdMutex.Unlock()
-
-	slog.Info("Igniting server...", "command", commandString)
-	parts := strings.Split(commandString, " ")
-	activeCmd = exec.Command(parts[0], parts[1:]...)
-	activeCmd.Stdout = os.Stdout
-	activeCmd.Stderr = os.Stderr
-
-	return activeCmd.Start()
+// build executes the compilation step synchronously
+func build(ctx context.Context, cmdStr string) error {
+	slog.Info("Compiling...", "cmd", cmdStr)
+	return prep(ctx, cmdStr).Run()
 }
 
-// stopServer executes a Graceful-to-Ruthless termination sequence.
-func stopServer() {
-	cmdMutex.Lock()
-	defer cmdMutex.Unlock()
+// start ignites the server asynchronously
+func start(cmdStr string) error {
+	srvMu.Lock()
+	defer srvMu.Unlock()
+	slog.Info("Starting server...", "cmd", cmdStr)
 
-	if activeCmd != nil && activeCmd.Process != nil {
-		slog.Info("Commencing server shutdown sequence...")
+	srv = prep(context.Background(), cmdStr)
+	return srv.Start()
+}
 
-		done := make(chan error, 1)
-		go func() {
-			done <- activeCmd.Wait()
-		}()
+// stop performs a graceful interrupt, falling back to a ruthless kill
+func stop() {
+	srvMu.Lock()
+	defer srvMu.Unlock()
 
-		err := activeCmd.Process.Signal(os.Interrupt)
-		if err != nil {
-			slog.Warn("Graceful interrupt unsupported or failed. Preparing to use force.")
-		} else {
-			slog.Info("Interrupt signal sent. Awaiting cooperative termination...")
-		}
-
-		select {
-		case <-time.After(100 * time.Millisecond):
-			slog.Warn("Executing ruthless termination.")
-			activeCmd.Process.Kill()
-			<-done
-			slog.Info("Server eradicated.")
-		case err := <-done:
-			if err != nil {
-				slog.Info("Server terminated with an exit code.", "error", err)
-			} else {
-				slog.Info("Server terminated gracefully.")
-			}
-		}
-
-		activeCmd = nil
+	if srv == nil || srv.Process == nil {
+		return
 	}
+
+	// chan struct{} is idiomatic Go for a signal-only channel
+	done := make(chan struct{})
+	go func() { srv.Wait(); close(done) }()
+
+	_ = srv.Process.Signal(os.Interrupt)
+
+	select {
+	case <-time.After(100 * time.Millisecond):
+		srv.Process.Kill()
+		<-done
+	case <-done:
+	}
+	srv = nil
 }
 
-// NEW: Recursive Directory Watcher with Filtering
-func watchRecursive(watcher *fsnotify.Watcher, root string) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
+// watch recursively adds directories to the watcher, filtering noise
+func watch(w *fsnotify.Watcher, root string) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
 			return err
 		}
-
-		// We only add directories to the watcher
-		if d.IsDir() {
-			name := d.Name()
-			// THE FILTER: Ignore heavy, irrelevant, or temporary directories.
-			if name == ".git" || name == "node_modules" || name == "bin" || name == "tmp" || name == "vendor" {
-				slog.Debug("Ignoring directory", "dir", path)
-				return filepath.SkipDir // Do not look inside this folder
-			}
-
-			err := watcher.Add(path)
-			if err != nil {
-				slog.Error("Failed to watch sub-directory", "path", path, "error", err)
-			} else {
-				slog.Info("Added to watch list", "directory", path)
-			}
+		switch d.Name() {
+		case ".git", "node_modules", "bin", "tmp", "vendor":
+			return filepath.SkipDir
 		}
-		return nil
+		return w.Add(p)
 	})
 }
 
+// dieIf is an idiomatic helper to reduce boilerplate during startup
+func dieIf(err error, msg string) {
+	if err != nil {
+		slog.Error(msg, "err", err)
+		os.Exit(1)
+	}
+}
+
 func main() {
-	rootPtr := flag.String("root", ".", "Directory to watch")
-	buildPtr := flag.String("build", "", "Command to build")
-	execPtr := flag.String("exec", "", "Command to run")
+	root := flag.String("root", ".", "Directory to watch")
+	bldCmd := flag.String("build", "", "Command to build")
+	runCmd := flag.String("exec", "", "Command to run")
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	slog.SetDefault(logger)
-
-	if *buildPtr == "" || *execPtr == "" {
-		slog.Error("Both --build and --exec commands are strictly required.")
+	if *bldCmd == "" || *runCmd == "" {
+		slog.Error("Flags --build and --exec required")
 		os.Exit(1)
 	}
 
-	if err := runBuild(context.Background(), *buildPtr); err != nil {
-		slog.Error("Primary compilation failed.", "error", err)
-		os.Exit(1)
-	}
+	dieIf(build(context.Background(), *bldCmd), "Initial build failed")
+	dieIf(start(*runCmd), "Initial start failed")
 
-	if err := startServer(*execPtr); err != nil {
-		slog.Error("Failed to start server.", "error", err)
-		os.Exit(1)
-	}
+	w, err := fsnotify.NewWatcher()
+	dieIf(err, "Watcher init failed")
+	defer w.Close()
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		slog.Error("Failed to initialize watcher", "error", err)
-		os.Exit(1)
-	}
-	defer watcher.Close()
+	dieIf(watch(w, *root), "Directory scan failed")
+	slog.Info("Engine active", "root", *root)
 
-	// NEW: Use our recursive function instead of watcher.Add()
-	if err := watchRecursive(watcher, *rootPtr); err != nil {
-		slog.Error("Failed to perform initial directory scan", "error", err)
-		os.Exit(1)
-	}
-
-	slog.Info("Observer active. Watching for changes...", "root", *rootPtr)
-
-	var rebuildTimer *time.Timer
-	debounceDelay := 500 * time.Millisecond
-
+	var timer *time.Timer
 	for {
 		select {
-		case event, ok := <-watcher.Events:
+		case e, ok := <-w.Events:
 			if !ok {
 				return
 			}
 
-			// NEW: Dynamic Directory Detection
-			// If a new item is created, check if it's a directory. If so, watch it!
-			if event.Has(fsnotify.Create) {
-				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-					slog.Info("New directory detected. Expanding surveillance...", "path", event.Name)
-					watchRecursive(watcher, event.Name)
+			// Dynamic directory detection
+			if e.Has(fsnotify.Create) {
+				if i, err := os.Stat(e.Name); err == nil && i.IsDir() {
+					watch(w, e.Name)
 				}
 			}
 
-			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
-
-				// Only care about Go files and module files.
-				ext := filepath.Ext(event.Name)
+			// File extension filter
+			if e.Has(fsnotify.Write) || e.Has(fsnotify.Create) || e.Has(fsnotify.Rename) {
+				ext := filepath.Ext(e.Name)
 				if ext != ".go" && ext != ".mod" && ext != ".sum" {
-					continue // Ignore everything else silently
+					continue
 				}
 
-				if rebuildTimer != nil {
-					rebuildTimer.Stop()
+				if timer != nil {
+					timer.Stop()
 				}
 
-				rebuildTimer = time.AfterFunc(debounceDelay, func() {
-					slog.Info("File event registered. Awaiting stability...", "file", event.Name)
-					stopServer()
+				// The Debounce & Preemption Payload
+				timer = time.AfterFunc(500*time.Millisecond, func() {
+					stop()
 
-					buildMutex.Lock()
-					if buildCancel != nil {
-						slog.Info("Preempting previous compilation...")
-						buildCancel()
+					bldMu.Lock()
+					if bldCancel != nil {
+						bldCancel()
 					}
-					var ctx context.Context
-					ctx, buildCancel = context.WithCancel(context.Background())
-					buildMutex.Unlock()
+					ctx, cancel := context.WithCancel(context.Background())
+					bldCancel = cancel
+					bldMu.Unlock()
 
-					if err := runBuild(ctx, *buildPtr); err != nil {
-						if ctx.Err() == context.Canceled {
-							slog.Info("Prior build successfully aborted.")
-						} else {
-							slog.Error("Recompilation failed.", "error", err)
-						}
-					} else {
-						startServer(*execPtr)
+					if err := build(ctx, *bldCmd); err == nil {
+						start(*runCmd)
+					} else if ctx.Err() != context.Canceled {
+						slog.Error("Build failed", "err", err)
 					}
 				})
 			}
-		case err, ok := <-watcher.Errors:
+		case err, ok := <-w.Errors:
 			if !ok {
 				return
 			}
-			slog.Error("Watcher error", "error", err)
+			slog.Error("Watcher error", "err", err)
 		}
 	}
 }
