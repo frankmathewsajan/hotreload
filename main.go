@@ -52,9 +52,43 @@ func stopServer() {
 	defer cmdMutex.Unlock()
 
 	if activeCmd != nil && activeCmd.Process != nil {
-		slog.Info("Halting existing server process...")
-		activeCmd.Process.Kill()
-		activeCmd.Wait()
+		slog.Info("Commencing server shutdown sequence...")
+
+		// We create a channel to listen for the process's dying breath.
+		done := make(chan error, 1)
+		go func() {
+			done <- activeCmd.Wait()
+		}()
+
+		// Step 1: The Polite Request (Graceful Shutdown)
+		// We send an Interrupt signal (equivalent to pressing Ctrl+C).
+
+		err := activeCmd.Process.Signal(os.Interrupt)
+		if err != nil {
+			slog.Warn("Graceful interrupt unsupported or failed. Preparing to use force.", "error", err)
+			// We do not return here; we fall through to the timeout/kill logic.
+		} else {
+			slog.Info("Interrupt signal sent. Awaiting cooperative termination...")
+		}
+
+		// Step 2: The Ultimatum (Timeout & Force Kill)
+		select {
+		case <-time.After(3 * time.Second):
+			// The process refused to comply within the 3-second window.
+			slog.Warn("Server is stubborn. Executing ruthless termination.")
+			activeCmd.Process.Kill() // The lethal blow
+			<-done                   // Wait for the operating system to clear the remains
+			slog.Info("Stubborn server eradicated.")
+
+		case err := <-done:
+			// The process closed itself down gracefully.
+			if err != nil {
+				slog.Info("Server terminated with an exit code.", "error", err)
+			} else {
+				slog.Info("Server terminated gracefully.")
+			}
+		}
+
 		activeCmd = nil
 	}
 }
