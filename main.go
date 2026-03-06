@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"os"
@@ -12,16 +13,22 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// Global state to track and kill the running server
 var (
 	activeCmd *exec.Cmd
 	cmdMutex  sync.Mutex
+
+	// State management for the build process
+	buildCancel context.CancelFunc
+	buildMutex  sync.Mutex
 )
 
-func runBuild(commandString string) error {
+// runBuild now accepts a context tether.
+func runBuild(ctx context.Context, commandString string) error {
 	slog.Info("Initiating compilation...", "command", commandString)
 	parts := strings.Split(commandString, " ")
-	cmd := exec.Command(parts[0], parts[1:]...)
+
+	// exec.CommandContext links the process to our cancellation tether.
+	cmd := exec.CommandContext(ctx, parts[0], parts[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -53,13 +60,11 @@ func stopServer() {
 }
 
 func main() {
-	// 1. Define and parse flags
-	rootPtr := flag.String("root", ".", "Directory to watch for file changes")
-	buildPtr := flag.String("build", "", "Command used to build the project")
-	execPtr := flag.String("exec", "", "Command used to run the built server")
+	rootPtr := flag.String("root", ".", "Directory to watch")
+	buildPtr := flag.String("build", "", "Command to build")
+	execPtr := flag.String("exec", "", "Command to run")
 	flag.Parse()
 
-	// 2. Configure logging
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
@@ -68,41 +73,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	slog.Info("Hot Reload Engine Initialized",
-		"root", *rootPtr,
-		"build", *buildPtr,
-		"exec", *execPtr,
-	)
-
-	// Phase 1: The Initial Build
-	if err := runBuild(*buildPtr); err != nil {
-		slog.Error("Primary compilation failed. Halting.", "error", err)
+	// Initial synchronous build using a background (uncancellable) context
+	if err := runBuild(context.Background(), *buildPtr); err != nil {
+		slog.Error("Primary compilation failed.", "error", err)
 		os.Exit(1)
 	}
 
-	// Phase 2: The Initial Ignition
 	if err := startServer(*execPtr); err != nil {
 		slog.Error("Failed to start server.", "error", err)
 		os.Exit(1)
 	}
 
-	// Phase 3: The Observer Setup
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		slog.Error("Failed to initialize file watcher", "error", err)
+		slog.Error("Failed to initialize watcher", "error", err)
 		os.Exit(1)
 	}
 	defer watcher.Close()
 
-	err = watcher.Add(*rootPtr)
-	if err != nil {
-		slog.Error("Failed to watch directory", "root", *rootPtr, "error", err)
+	if err := watcher.Add(*rootPtr); err != nil {
+		slog.Error("Failed to watch directory", "error", err)
 		os.Exit(1)
 	}
 
 	slog.Info("Observer active. Watching for changes...", "directory", *rootPtr)
 
-	// Phase 4: The Debounce Mechanism
 	var rebuildTimer *time.Timer
 	debounceDelay := 500 * time.Millisecond
 
@@ -114,22 +109,35 @@ func main() {
 			}
 
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
-
 				if rebuildTimer != nil {
 					rebuildTimer.Stop()
 				}
 
-				slog.Info("File event registered. Awaiting stability...", "file", event.Name)
-
 				rebuildTimer = time.AfterFunc(debounceDelay, func() {
-					slog.Info("File system stable. Commencing reload sequence.")
-
 					stopServer()
 
-					if err := runBuild(*buildPtr); err == nil {
-						startServer(*execPtr)
+					// Preemption Logic
+					buildMutex.Lock()
+					if buildCancel != nil {
+						slog.Info("Preempting previous compilation...")
+						buildCancel() // Sever the tether
+					}
+
+					// Forge a new tether for the upcoming build
+					var ctx context.Context
+					ctx, buildCancel = context.WithCancel(context.Background())
+					buildMutex.Unlock()
+
+					// Execute the build with the new tether
+					if err := runBuild(ctx, *buildPtr); err != nil {
+						// If the error was our own intentional cancellation, remain calm.
+						if ctx.Err() == context.Canceled {
+							slog.Info("Prior build successfully aborted.")
+						} else {
+							slog.Error("Recompilation failed.", "error", err)
+						}
 					} else {
-						slog.Error("Recompilation failed. Waiting for next file change.")
+						startServer(*execPtr)
 					}
 				})
 			}
@@ -137,7 +145,7 @@ func main() {
 			if !ok {
 				return
 			}
-			slog.Error("Watcher encountered an error", "error", err)
+			slog.Error("Watcher error", "error", err)
 		}
 	}
 }
