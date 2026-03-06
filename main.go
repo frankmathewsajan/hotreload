@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 func main() {
@@ -38,41 +39,63 @@ func main() {
 	slog.Info("Hot Reload Engine Initialized" /* ... */)
 
 	// Phase 1: The Initial Build
-	slog.Info("Initiating primary build sequence...")
-	if err := executeCommand(*buildPtr); err != nil {
+	if err := runBuild(*buildPtr); err != nil {
 		slog.Error("Primary compilation failed. Halting.", "error", err)
 		os.Exit(1)
 	}
 
-	// Phase 2: The Initial Ignition
-	slog.Info("Build successful. Igniting server...")
-	if err := executeCommand(*execPtr); err != nil {
-		slog.Error("Server execution terminated abruptly.", "error", err)
+	// Phase 2: The Initial Ignition (Now running in the background)
+	if err := startServer(*execPtr); err != nil {
+		slog.Error("Failed to start server.", "error", err)
+		os.Exit(1)
 	}
+
+	// For now, we need to prevent the main program from exiting immediately
+	// since startServer no longer blocks. We will replace this in the next commit.
+	select {}
 }
 
-// Add "strings" and "os/exec" to your import block at the top.
+// Add "sync" to your import block.
 
-// executeCommand acts as a universal wrapper for running terminal commands.
-func executeCommand(commandString string) error {
-	// Assumption: We assume arguments are separated by spaces.
-	// A robust shell parser would be needed for complex quoted arguments,
-	// but this suffices for the assignment's expected inputs.
+var (
+	activeCmd *exec.Cmd
+	cmdMutex  sync.Mutex // Protects activeCmd from race conditions
+)
+
+// runBuild runs synchronously. It blocks until the build is complete.
+func runBuild(commandString string) error {
+	slog.Info("Initiating compilation...", "command", commandString)
 	parts := strings.Split(commandString, " ")
-	mainCommand := parts[0]
-	args := parts[1:]
-
-	// Construct the command architecture.
-	cmd := exec.Command(mainCommand, args...)
-
-	// CRITICAL REQUIREMENT: Stream logs in real-time.
-	// By attaching the child's output directly to our operating system's standard output,
-	// we bypass any Go-level buffering.
+	cmd := exec.Command(parts[0], parts[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
-	slog.Info("Executing process", "command", commandString)
-
-	// Run executes the command and waits for it to complete.
 	return cmd.Run()
+}
+
+// startServer runs asynchronously. It starts the process and returns immediately.
+func startServer(commandString string) error {
+	cmdMutex.Lock()
+	defer cmdMutex.Unlock()
+
+	slog.Info("Igniting server...", "command", commandString)
+	parts := strings.Split(commandString, " ")
+	activeCmd = exec.Command(parts[0], parts[1:]...)
+	activeCmd.Stdout = os.Stdout
+	activeCmd.Stderr = os.Stderr
+
+	// Use Start() instead of Run(). Start() does not wait for the process to finish.
+	return activeCmd.Start()
+}
+
+// stopServer brutally terminates the currently running server to free up the port.
+func stopServer() {
+	cmdMutex.Lock()
+	defer cmdMutex.Unlock()
+
+	if activeCmd != nil && activeCmd.Process != nil {
+		slog.Info("Halting existing server process...")
+		activeCmd.Process.Kill() // Deliver the fatal blow
+		activeCmd.Wait()         // Wait for the operating system to clean up the corpse
+		activeCmd = nil
+	}
 }
