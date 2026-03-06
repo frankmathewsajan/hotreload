@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func main() {
@@ -50,9 +52,53 @@ func main() {
 		os.Exit(1)
 	}
 
-	// For now, we need to prevent the main program from exiting immediately
-	// since startServer no longer blocks. We will replace this in the next commit.
-	select {}
+	// Phase 3: The Observer
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		slog.Error("Failed to initialize file watcher", "error", err)
+		os.Exit(1)
+	}
+	defer watcher.Close()
+
+	// Instruct the watcher to monitor our target directory.
+	// Note: This only watches the top-level folder for now. We will add deep traversal later.
+	err = watcher.Add(*rootPtr)
+	if err != nil {
+		slog.Error("Failed to watch directory", "root", *rootPtr, "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("Observer active. Watching for changes...", "directory", *rootPtr)
+
+	// The Infinite Observation Loop
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			// We only care if a file was written to or created.
+			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
+				slog.Info("Modification detected!", "file", event.Name)
+
+				// 1. Terminate the old server
+				stopServer()
+
+				// 2. Recompile the code
+				if err := runBuild(*buildPtr); err == nil {
+					// 3. Ignite the new server
+					startServer(*execPtr)
+				} else {
+					slog.Error("Recompilation failed. Waiting for next file change to try again.")
+				}
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			slog.Error("Watcher encountered an error", "error", err)
+		}
+	}
 }
 
 // Add "sync" to your import block.
