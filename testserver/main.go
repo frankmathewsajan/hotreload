@@ -11,7 +11,7 @@ func main() {
 	fmt.Println("[TEST SERVER] Booting up on port 8080...")
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Hello, World! I am Frank Mathew Sajan!\n")
+		fmt.Fprintf(w, "I am just testing for now...\n")
 	})
 
 	// Start the server and listen for requests

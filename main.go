@@ -67,11 +67,11 @@ func stopServer() {
 		}
 
 		select {
-		case <-time.After(3 * time.Second):
-			slog.Warn("Server is stubborn. Executing ruthless termination.")
+		case <-time.After(100 * time.Millisecond):
+			slog.Warn("Executing ruthless termination.")
 			activeCmd.Process.Kill()
 			<-done
-			slog.Info("Stubborn server eradicated.")
+			slog.Info("Server eradicated.")
 		case err := <-done:
 			if err != nil {
 				slog.Info("Server terminated with an exit code.", "error", err)
@@ -171,9 +171,10 @@ func main() {
 
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
 
-				// Optional: Filter out editor swap files or temporary files so they don't trigger rebuilds
-				if strings.HasSuffix(event.Name, "~") || strings.HasPrefix(filepath.Base(event.Name), ".") {
-					continue
+				// Only care about Go files and module files.
+				ext := filepath.Ext(event.Name)
+				if ext != ".go" && ext != ".mod" && ext != ".sum" {
+					continue // Ignore everything else silently
 				}
 
 				if rebuildTimer != nil {
