@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"flag"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -14,26 +16,23 @@ import (
 )
 
 var (
-	activeCmd *exec.Cmd
-	cmdMutex  sync.Mutex
-
-	// State management for the build process
+	activeCmd   *exec.Cmd
+	cmdMutex    sync.Mutex
 	buildCancel context.CancelFunc
 	buildMutex  sync.Mutex
 )
 
-// runBuild now accepts a context tether.
+// runBuild compiles the target binary.
 func runBuild(ctx context.Context, commandString string) error {
 	slog.Info("Initiating compilation...", "command", commandString)
 	parts := strings.Split(commandString, " ")
-
-	// exec.CommandContext links the process to our cancellation tether.
 	cmd := exec.CommandContext(ctx, parts[0], parts[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
+// startServer ignites the compiled binary.
 func startServer(commandString string) error {
 	cmdMutex.Lock()
 	defer cmdMutex.Unlock()
@@ -47,6 +46,7 @@ func startServer(commandString string) error {
 	return activeCmd.Start()
 }
 
+// stopServer executes a Graceful-to-Ruthless termination sequence.
 func stopServer() {
 	cmdMutex.Lock()
 	defer cmdMutex.Unlock()
@@ -54,34 +54,25 @@ func stopServer() {
 	if activeCmd != nil && activeCmd.Process != nil {
 		slog.Info("Commencing server shutdown sequence...")
 
-		// We create a channel to listen for the process's dying breath.
 		done := make(chan error, 1)
 		go func() {
 			done <- activeCmd.Wait()
 		}()
 
-		// Step 1: The Polite Request (Graceful Shutdown)
-		// We send an Interrupt signal (equivalent to pressing Ctrl+C).
-
 		err := activeCmd.Process.Signal(os.Interrupt)
 		if err != nil {
-			slog.Warn("Graceful interrupt unsupported or failed. Preparing to use force.", "error", err)
-			// We do not return here; we fall through to the timeout/kill logic.
+			slog.Warn("Graceful interrupt unsupported or failed. Preparing to use force.")
 		} else {
 			slog.Info("Interrupt signal sent. Awaiting cooperative termination...")
 		}
 
-		// Step 2: The Ultimatum (Timeout & Force Kill)
 		select {
 		case <-time.After(3 * time.Second):
-			// The process refused to comply within the 3-second window.
 			slog.Warn("Server is stubborn. Executing ruthless termination.")
-			activeCmd.Process.Kill() // The lethal blow
-			<-done                   // Wait for the operating system to clear the remains
+			activeCmd.Process.Kill()
+			<-done
 			slog.Info("Stubborn server eradicated.")
-
 		case err := <-done:
-			// The process closed itself down gracefully.
 			if err != nil {
 				slog.Info("Server terminated with an exit code.", "error", err)
 			} else {
@@ -93,13 +84,40 @@ func stopServer() {
 	}
 }
 
+// NEW: Recursive Directory Watcher with Filtering
+func watchRecursive(watcher *fsnotify.Watcher, root string) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// We only add directories to the watcher
+		if d.IsDir() {
+			name := d.Name()
+			// THE FILTER: Ignore heavy, irrelevant, or temporary directories.
+			if name == ".git" || name == "node_modules" || name == "bin" || name == "tmp" || name == "vendor" {
+				slog.Debug("Ignoring directory", "dir", path)
+				return filepath.SkipDir // Do not look inside this folder
+			}
+
+			err := watcher.Add(path)
+			if err != nil {
+				slog.Error("Failed to watch sub-directory", "path", path, "error", err)
+			} else {
+				slog.Info("Added to watch list", "directory", path)
+			}
+		}
+		return nil
+	})
+}
+
 func main() {
 	rootPtr := flag.String("root", ".", "Directory to watch")
 	buildPtr := flag.String("build", "", "Command to build")
 	execPtr := flag.String("exec", "", "Command to run")
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
 	if *buildPtr == "" || *execPtr == "" {
@@ -107,7 +125,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Initial synchronous build using a background (uncancellable) context
 	if err := runBuild(context.Background(), *buildPtr); err != nil {
 		slog.Error("Primary compilation failed.", "error", err)
 		os.Exit(1)
@@ -125,12 +142,13 @@ func main() {
 	}
 	defer watcher.Close()
 
-	if err := watcher.Add(*rootPtr); err != nil {
-		slog.Error("Failed to watch directory", "error", err)
+	// NEW: Use our recursive function instead of watcher.Add()
+	if err := watchRecursive(watcher, *rootPtr); err != nil {
+		slog.Error("Failed to perform initial directory scan", "error", err)
 		os.Exit(1)
 	}
 
-	slog.Info("Observer active. Watching for changes...", "directory", *rootPtr)
+	slog.Info("Observer active. Watching for changes...", "root", *rootPtr)
 
 	var rebuildTimer *time.Timer
 	debounceDelay := 500 * time.Millisecond
@@ -142,29 +160,40 @@ func main() {
 				return
 			}
 
+			// NEW: Dynamic Directory Detection
+			// If a new item is created, check if it's a directory. If so, watch it!
+			if event.Has(fsnotify.Create) {
+				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+					slog.Info("New directory detected. Expanding surveillance...", "path", event.Name)
+					watchRecursive(watcher, event.Name)
+				}
+			}
+
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
+
+				// Optional: Filter out editor swap files or temporary files so they don't trigger rebuilds
+				if strings.HasSuffix(event.Name, "~") || strings.HasPrefix(filepath.Base(event.Name), ".") {
+					continue
+				}
+
 				if rebuildTimer != nil {
 					rebuildTimer.Stop()
 				}
 
 				rebuildTimer = time.AfterFunc(debounceDelay, func() {
+					slog.Info("File event registered. Awaiting stability...", "file", event.Name)
 					stopServer()
 
-					// Preemption Logic
 					buildMutex.Lock()
 					if buildCancel != nil {
 						slog.Info("Preempting previous compilation...")
-						buildCancel() // Sever the tether
+						buildCancel()
 					}
-
-					// Forge a new tether for the upcoming build
 					var ctx context.Context
 					ctx, buildCancel = context.WithCancel(context.Background())
 					buildMutex.Unlock()
 
-					// Execute the build with the new tether
 					if err := runBuild(ctx, *buildPtr); err != nil {
-						// If the error was our own intentional cancellation, remain calm.
 						if ctx.Err() == context.Canceled {
 							slog.Info("Prior build successfully aborted.")
 						} else {
