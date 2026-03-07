@@ -9,10 +9,10 @@ Prereqs
 
 Run
 - Use this command:
-  `go run main.go --root ./tserver --build "go build -o ./bin/server.exe ./tserver/main.go" --exec "./bin/server.exe"`
+  `go run main.go --root ./testserver --build "go build -o ./bin/server.exe ./testserver/main.go" --exec "./bin/server.exe"`
 
 How it works
-- Watches files under `./tserver`.
+- Watches files under `./testserver`.
 - On change: runs the `--build` command; if build succeeds, kills previous run and starts `--exec`.
 
 Notes
