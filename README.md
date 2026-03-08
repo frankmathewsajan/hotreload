@@ -55,5 +55,5 @@ go run main.go --root ./testserver --build "go build -o ./bin/server.exe ./tests
 
 - main.go: The core hot-reload engine.
 - main_test.go: Unit tests validating directory and file extension filtering logic.
-- 	estserver/: A sample standalone Go application for testing the watcher.
+- testserver/: A sample standalone Go application for testing the watcher.
 - Makefile: Convenience commands (make test, make run).
