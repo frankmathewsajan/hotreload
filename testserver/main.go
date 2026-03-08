@@ -16,7 +16,7 @@ func main() {
 			<title>Hot Reload</title>
 		</head>
 		<body>
-			<h1>Go Live Server!</h1>
+			<h1>Go Live Server!!!!!</h1>
 			<p>Modify this text in testserver/main.go and hit save</p>
 			
 			<script>

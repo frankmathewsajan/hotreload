@@ -121,14 +121,12 @@ func main() {
 				return
 			}
 
-			// Dynamic directory detection
 			if e.Has(fsnotify.Create) {
 				if i, err := os.Stat(e.Name); err == nil && i.IsDir() {
 					watch(w, e.Name)
 				}
 			}
 
-			// File extension filter
 			if e.Has(fsnotify.Write) || e.Has(fsnotify.Create) || e.Has(fsnotify.Rename) {
 				ext := filepath.Ext(e.Name)
 				if ext != ".go" && ext != ".mod" && ext != ".sum" {
@@ -139,7 +137,6 @@ func main() {
 					timer.Stop()
 				}
 
-				// The Debounce & Preemption Payload
 				timer = time.AfterFunc(500*time.Millisecond, func() {
 					stop()
 
